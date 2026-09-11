@@ -3,6 +3,8 @@ package graphql
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -25,6 +27,51 @@ func TestFieldSet_MarshalGQL(t *testing.T) {
 
 		assert.JSONEq(t, "{\"__typename\":\"A\"}", b.String())
 	})
+
+	// Exercises the map-upgrade path: a selection larger than the stack buffer
+	// (16 aliases) with a duplicate beyond the buffer boundary.
+	t.Run("Should_Deduplicate_Keys_Beyond_Stack_Buffer", func(t *testing.T) {
+		const n = 40
+		fields := make([]CollectedField, 0, n+1)
+		for i := range n {
+			fields = append(fields, CollectedField{Field: &ast.Field{Alias: fmt.Sprintf("f%d", i)}})
+		}
+		// Duplicate of the very first alias, appearing after the buffer upgrade.
+		fields = append(fields, CollectedField{Field: &ast.Field{Alias: "f0"}})
+
+		fs := NewFieldSet(fields)
+		for i := range fs.Values {
+			fs.Values[i] = MarshalInt(i)
+		}
+
+		b := bytes.NewBuffer(nil)
+		fs.MarshalGQL(b)
+
+		expected := make(map[string]int, n)
+		for i := range n {
+			expected[fmt.Sprintf("f%d", i)] = i // "f0" keeps its first value, 0
+		}
+		expectedJSON, err := json.Marshal(expected)
+		assert.NoError(t, err)
+		assert.JSONEq(t, string(expectedJSON), b.String())
+	})
+}
+
+func BenchmarkMarshalFieldSet(b *testing.B) {
+	fields := make([]CollectedField, 0, 8)
+	for i := range 8 {
+		fields = append(fields, CollectedField{Field: &ast.Field{Alias: fmt.Sprintf("field%d", i)}})
+	}
+	values := make([]Marshaler, len(fields))
+	for i := range values {
+		values[i] = MarshalInt(i)
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		var buf bytes.Buffer
+		marshalFieldSet(&buf, fields, nil, values)
+	}
 }
 
 func addConcurrentFieldAndReturnIndex(

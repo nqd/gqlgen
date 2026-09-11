@@ -3,7 +3,6 @@ package graphql
 import (
 	"context"
 	"io"
-	"iter"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -56,27 +55,10 @@ func (v *FieldSetView) AddIndices(indices ...int) {
 // in normal use that means waiting for the onComplete callback registered via
 // SetOnComplete.
 func (v *FieldSetView) MarshalGQL(writer io.Writer) {
-	marshalFieldSet(writer, v.consumeFieldValues())
-}
-
-// consumeFieldValues yields each (field, value) pair for the view's indices
-// and nils the corresponding entries on the underlying [FieldSet] via
-// [FieldSet.takeValues]. A second call from this view — or from any other
-// view sharing the same index — yields nothing for the consumed indices.
-func (v *FieldSetView) consumeFieldValues() iter.Seq2[*CollectedField, Marshaler] {
-	return func(yield func(*CollectedField, Marshaler) bool) {
-		values := v.fieldSet.takeValues(v.indices)
-		for i, value := range values {
-			if value == nil {
-				continue
-			}
-
-			field := &v.fieldSet.fields[v.indices[i]]
-			if !yield(field, value) {
-				return
-			}
-		}
-	}
+	// takeValues nils the consumed entries on the underlying [FieldSet], so a
+	// second call from this view — or from any other view sharing the same
+	// index — writes nothing for the consumed indices.
+	marshalFieldSet(writer, v.fieldSet.fields, v.indices, v.fieldSet.takeValues(v.indices))
 }
 
 type FieldSet struct {
@@ -158,37 +140,69 @@ func (m *FieldSet) executeDelayed(ctx context.Context, delayed *delayedResult) {
 }
 
 func (m *FieldSet) MarshalGQL(writer io.Writer) {
-	marshalFieldSet(writer, m.allFieldValues())
+	marshalFieldSet(writer, m.fields, nil, m.Values)
 }
 
-func (m *FieldSet) allFieldValues() iter.Seq2[*CollectedField, Marshaler] {
-	return func(yield func(*CollectedField, Marshaler) bool) {
-		for i, field := range m.fields {
-			if !yield(&field, m.Values[i]) {
-				return
-			}
-		}
-	}
-}
-
-func marshalFieldSet(writer io.Writer, fieldValues iter.Seq2[*CollectedField, Marshaler]) {
+// marshalFieldSet writes the JSON object for fields and their resolved values.
+// values[i] holds the value for fields[i], or for fields[indices[i]] when
+// indices is non-nil (a view over a subset). A nil value is skipped — its
+// field was not resolved or was already consumed by another view.
+func marshalFieldSet(writer io.Writer, fields []CollectedField, indices []int, values []Marshaler) {
 	writer.Write(openBrace)
-	writtenFields := make(map[string]struct{})
+
+	// Track written aliases to skip duplicate response aliases. Duplicates are
+	// rare — field collection already merges same-alias fields — so avoid the
+	// per-object map allocation by scanning a stack-backed slice for the common
+	// small-object case, upgrading to a map only for large selections where the
+	// linear scan's O(n²) cost would dominate.
+	var writtenBacking [16]string
+	written := writtenBacking[:0]
+	var writtenMap map[string]struct{}
+
 	isFirst := true
-	for field, marshaler := range fieldValues {
-		if _, ok := writtenFields[field.Alias]; ok {
+	for i, marshaler := range values {
+		if marshaler == nil {
 			continue
 		}
+
+		alias := fields[i].Alias
+		if indices != nil {
+			alias = fields[indices[i]].Alias
+		}
+
+		if writtenMap != nil {
+			if _, ok := writtenMap[alias]; ok {
+				continue
+			}
+		} else if slices.Contains(written, alias) {
+			continue
+		}
+
 		if !isFirst {
 			writer.Write(comma)
 		} else {
 			isFirst = false
 		}
 
-		writeQuotedString(writer, field.Alias)
+		writeQuotedString(writer, alias)
 		writer.Write(colon)
 		marshaler.MarshalGQL(writer)
-		writtenFields[field.Alias] = struct{}{}
+
+		switch {
+		case writtenMap != nil:
+			writtenMap[alias] = struct{}{}
+		case len(written) < cap(written):
+			written = append(written, alias)
+		default:
+			// Selection outgrew the stack buffer; switch to a map so duplicate
+			// detection stays O(1) per field.
+			writtenMap = make(map[string]struct{}, len(written)*2)
+			for _, a := range written {
+				writtenMap[a] = struct{}{}
+			}
+			writtenMap[alias] = struct{}{}
+			written = nil
+		}
 	}
 	writer.Write(closeBrace)
 }
